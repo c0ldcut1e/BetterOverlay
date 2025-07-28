@@ -4,7 +4,9 @@
 #include <utils/Logger.h>
 #include <utils/Types.h>
 
-#include <coreinit/debug.h>
+#include <coreinit/cache.h>
+#include <coreinit/fastmutex.h>
+#include <coreinit/memory.h>
 #include <gx2/draw.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
@@ -14,13 +16,16 @@
 
 #include <memory/mappedmemory.h>
 
+#define BUFFER_COUNT 4
+
 struct ImGui_ImplGX2_Data {
     ImGui_ImplGX2_Data() { OSBlockSet(this, 0, sizeof(*this)); }
 
-    void *vtxBuffer;
-    void *idxBuffer;
-    uint32_t vtxBufferSize;
-    uint32_t idxBufferSize;
+    void *vtxBuffers[BUFFER_COUNT]{};
+    void *idxBuffers[BUFFER_COUNT]{};
+    uint32_t vtxBufferSizes[BUFFER_COUNT]{};
+    uint32_t idxBufferSizes[BUFFER_COUNT]{};
+    int32_t bufferIndex{};
 
     ImGui_ImplGX2_Texture *fontTex{};
 
@@ -30,14 +35,15 @@ struct ImGui_ImplGX2_Data {
 static OSFastMutex mutex;
 
 static ImGui_ImplGX2_Data *ImGui_ImplGX2_GetBackendData() {
-    return ImGui::GetCurrentContext() ? (ImGui_ImplGX2_Data *) ImGui::GetIO()
-                                                .BackendRendererUserData
-                                      : NULL;
+    return ImGui::GetCurrentContext()
+                   ? static_cast<ImGui_ImplGX2_Data *>(
+                             ImGui::GetIO().BackendRendererUserData)
+                   : nullptr;
 }
 
 bool ImGui_ImplGX2_Init() {
     ImGuiIO &io = ImGui::GetIO();
-    IM_ASSERT(io.BackendRendererUserData == NULL &&
+    IM_ASSERT(io.BackendRendererUserData == nullptr &&
               "Already initialized a renderer backend!");
 
     auto *data = IM_NEW(ImGui_ImplGX2_Data)();
@@ -61,7 +67,7 @@ void ImGui_ImplGX2_Shutdown() {
     OSFastMutex_Lock(&mutex);
 
     ImGui_ImplGX2_Data *data = ImGui_ImplGX2_GetBackendData();
-    IM_ASSERT(data != NULL &&
+    IM_ASSERT(data != nullptr &&
               "No renderer backend to shutdown, or already shutdown?");
 
     ImGuiIO &io = ImGui::GetIO();
@@ -86,8 +92,9 @@ void ImGui_ImplGX2_NewFrame() {
     OSFastMutex_Unlock(&mutex);
 }
 
-static void ImGui_ImplGX2_SetupRenderState(ImDrawData *data, int32_t width,
-                                           int32_t height) {
+static void ImGui_ImplGX2_SetupRenderState(const ImDrawData *data,
+                                           const int32_t width,
+                                           const int32_t height) {
     ImGui_ImplGX2_Data *backendData = ImGui_ImplGX2_GetBackendData();
     IM_ASSERT(backendData != nullptr &&
               "No renderer backend to shutdown, or already shutdown?");
@@ -146,10 +153,15 @@ void ImGui_ImplGX2_RenderDrawData(ImDrawData *data) {
 
     ImGui_ImplGX2_Data *backendData = ImGui_ImplGX2_GetBackendData();
 
-    if (backendData->vtxBufferSize < vtxBufferSize) {
-        backendData->vtxBufferSize = vtxBufferSize;
-        MEMFreeToMappedMemory(backendData->vtxBuffer);
-        backendData->vtxBuffer = MEMAllocFromMappedMemoryForGX2Ex(
+    const int32_t bufferIdx  = backendData->bufferIndex;
+    backendData->bufferIndex = (bufferIdx + 1) % BUFFER_COUNT;
+
+    if (backendData->vtxBufferSizes[bufferIdx] < vtxBufferSize) {
+        if (backendData->vtxBuffers[bufferIdx])
+            MEMFreeToMappedMemory(backendData->vtxBuffers[bufferIdx]);
+
+        backendData->vtxBufferSizes[bufferIdx] = vtxBufferSize;
+        backendData->vtxBuffers[bufferIdx] = MEMAllocFromMappedMemoryForGX2Ex(
                 vtxBufferSize, GX2_VERTEX_BUFFER_ALIGNMENT);
     }
 
@@ -162,18 +174,20 @@ void ImGui_ImplGX2_RenderDrawData(ImDrawData *data) {
                 idxBufferSize, GX2_INDEX_BUFFER_ALIGNMENT);
     }
 
-    uint8_t *vtxDest = (uint8_t *) backendData->vtxBuffer;
-    uint8_t *idxDest = (uint8_t *) backendData->idxBuffer;
+    auto *vtxBase = static_cast<uint8_t *>(backendData->vtxBuffers[bufferIdx]);
+    auto *idxBase = static_cast<uint8_t *>(backendData->idxBuffers[bufferIdx]);
+    uint8_t *vtxDest = vtxBase;
+    uint8_t *idxDest = idxBase;
 
     for (int32_t i = 0; i < data->CmdListsCount; i++) {
         const ImDrawList *cmdList = data->CmdLists[i];
 
-        memcpy(vtxDest, cmdList->VtxBuffer.Data,
-               cmdList->VtxBuffer.Size * sizeof(ImDrawVert));
+        OSBlockMove(vtxDest, cmdList->VtxBuffer.Data,
+                    cmdList->VtxBuffer.Size * sizeof(ImDrawVert), false);
         vtxDest += cmdList->VtxBuffer.Size * sizeof(ImDrawVert);
 
-        memcpy(idxDest, cmdList->IdxBuffer.Data,
-               cmdList->IdxBuffer.Size * sizeof(ImDrawIdx));
+        OSBlockMove(idxDest, cmdList->IdxBuffer.Data,
+                    cmdList->IdxBuffer.Size * sizeof(ImDrawIdx), false);
         idxDest += cmdList->IdxBuffer.Size * sizeof(ImDrawIdx);
     }
 
@@ -194,30 +208,35 @@ void ImGui_ImplGX2_RenderDrawData(ImDrawData *data) {
     for (int32_t i = 0; i < data->CmdListsCount; i++) {
         const ImDrawList *cmdList = data->CmdLists[i];
 
-        for (int32_t i = 0; i < cmdList->CmdBuffer.Size; i++) {
-            const ImDrawCmd *pcmd = &cmdList->CmdBuffer[i];
-
-            if (pcmd->UserCallback != NULL) {
+        for (int32_t j = 0; j < cmdList->CmdBuffer.Size; j++) {
+            if (const ImDrawCmd *pcmd = &cmdList->CmdBuffer[j];
+                pcmd->UserCallback != nullptr) {
                 if (pcmd->UserCallback == ImDrawCallback_ResetRenderState)
                     ImGui_ImplGX2_SetupRenderState(data, width, height);
                 else
                     pcmd->UserCallback(cmdList, pcmd);
             } else {
-                ImVec2 clipMin((pcmd->ClipRect.x - clipOff.x) * clipScale.x,
-                               (pcmd->ClipRect.y - clipOff.y) * clipScale.y);
-                ImVec2 clipMax((pcmd->ClipRect.z - clipOff.x) * clipScale.x,
-                               (pcmd->ClipRect.w - clipOff.y) * clipScale.y);
+                const ImVec2 clipMin(
+                        (pcmd->ClipRect.x - clipOff.x) * clipScale.x,
+                        (pcmd->ClipRect.y - clipOff.y) * clipScale.y);
+                const ImVec2 clipMax(
+                        (pcmd->ClipRect.z - clipOff.x) * clipScale.x,
+                        (pcmd->ClipRect.w - clipOff.y) * clipScale.y);
                 if (clipMax.x <= clipMin.x || clipMax.y <= clipMin.y) continue;
-                if (clipMin.x < 0.0f || clipMin.y < 0.0f || clipMax.x > width ||
-                    clipMax.y > height || !pcmd->ElemCount)
+                if (clipMin.x < 0.0f || clipMin.y < 0.0f ||
+                    clipMax.x > static_cast<float32_t>(width) ||
+                    clipMax.y > static_cast<float32_t>(height) ||
+                    !pcmd->ElemCount)
                     continue;
 
-                GX2SetScissor(clipMin.x, clipMin.y, clipMax.x - clipMin.x,
-                              clipMax.y - clipMin.y);
+                GX2SetScissor(static_cast<uint32_t>(clipMin.x),
+                              static_cast<uint32_t>(clipMin.y),
+                              static_cast<uint32_t>(clipMax.x - clipMin.x),
+                              static_cast<uint32_t>(clipMax.y - clipMin.y));
 
-                ImGui_ImplGX2_Texture *tex =
-                        (ImGui_ImplGX2_Texture *) pcmd->GetTexID();
-                IM_ASSERT(tex && "tex_id cannot be NULL");
+                const auto *tex =
+                        static_cast<ImGui_ImplGX2_Texture *>(pcmd->GetTexID());
+                IM_ASSERT(tex && "tex_id cannot be nullptr");
 
                 GX2SetPixelTexture(tex->tex, 0);
                 GX2SetPixelSampler(tex->sampler, 0);
@@ -282,20 +301,20 @@ bool ImGui_ImplGX2_CreateFontsTexture() {
     GX2InitTextureRegs(tex);
 
     tex->surface.image = MEMAllocFromMappedMemoryForGX2Ex(
-            tex->surface.imageSize, tex->surface.alignment);
+            tex->surface.imageSize, (int32_t) tex->surface.alignment);
 
     auto *destPixels = (uint8_t *) tex->surface.image;
 
     for (int i = 0; i < height; i++)
-        memcpy(destPixels + (i * tex->surface.pitch * 4),
-               srcPixels + (i * width * 4), width * 4);
+        OSBlockMove(destPixels + (i * tex->surface.pitch * 4),
+                    srcPixels + (i * width * 4), width * 4, false);
 
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, destPixels,
                   tex->surface.imageSize);
 
     data->fontTex->sampler = IM_NEW(GX2Sampler)();
     GX2InitSampler(data->fontTex->sampler, GX2_TEX_CLAMP_MODE_CLAMP,
-                   GX2_TEX_XY_FILTER_MODE_LINEAR);
+                   GX2_TEX_XY_FILTER_MODE_POINT);
 
     io.Fonts->SetTexID(data->fontTex);
 
@@ -344,12 +363,19 @@ void ImGui_ImplGX2_DestroyDeviceObjects() {
     OSFastMutex_Lock(&mutex);
 
     ImGui_ImplGX2_Data *data = ImGui_ImplGX2_GetBackendData();
+    IM_ASSERT(data != nullptr && "Did you call ImGui_ImplGX2_Init() ?");
 
-    MEMFreeToMappedMemory(data->vtxBuffer);
-    data->vtxBuffer = NULL;
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (data->vtxBuffers[i]) {
+            MEMFreeToMappedMemory(data->vtxBuffers[i]);
+            data->vtxBuffers[i] = nullptr;
+        }
 
-    MEMFreeToMappedMemory(data->idxBuffer);
-    data->idxBuffer = NULL;
+        if (data->idxBuffers[i]) {
+            MEMFreeToMappedMemory(data->idxBuffers[i]);
+            data->idxBuffers[i] = nullptr;
+        }
+    }
 
     unloadTexShader(*data->shader);
     IM_DELETE(data->shader);
