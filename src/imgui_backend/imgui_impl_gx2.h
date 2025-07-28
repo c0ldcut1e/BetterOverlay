@@ -10,8 +10,9 @@
 struct ImGui_ImplGX2_Texture {
     ImGui_ImplGX2_Texture() { memset(this, 0, sizeof(*this)); }
 
-    GX2Texture *tex;
-    GX2Sampler *sampler;
+    GX2Texture *tex{};
+    GX2Sampler *sampler{};
+    int32_t loadFrame{};
 };
 
 IMGUI_IMPL_API bool ImGui_ImplGX2_Init();

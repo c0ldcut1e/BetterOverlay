@@ -8,4 +8,4 @@ This is basically the [imgui_overlay_plugin](https://github.com/GaryOderNichts/i
 ## How to build
 Simply run `make` to compile and `make clean` to clean.
 ## Credits
-- [GaryOderNicht](https://github.com/garyodernichts) for the [imgui_overlay_plugin](https://github.com/GaryOderNichts/imgui_overlay_plugin) from which I took a lot of stuff from, without this I couldn't have made this.
+- [GaryOderNichts](https://github.com/garyodernichts) for the [imgui_overlay_plugin](https://github.com/GaryOderNichts/imgui_overlay_plugin) from which I took a lot of stuff from, without this I couldn't have made this.
